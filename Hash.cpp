@@ -1,6 +1,7 @@
 #include "Hash.h"
 #include <algorithm>
 #include <vector>
+#include <cstring>
 
 
 

@@ -5,6 +5,7 @@
 #include <string>
 #include "NPKFile.h"
 #include <filesystem>
+#include <vector>
 int main(int argc, char* argv[])
 {
 
@@ -27,6 +28,7 @@ int main(int argc, char* argv[])
         std::cout << "USAGE: SMCNPK.exe <option> <Input> <output>" << "\n";
         std::cout << "options: -u (unpack single .npk)" << "\n";
         std::cout << "         -m (unpack all npk's in the input dir)" << "\n";
+        std::cout << "         -p (patch existing files into .npk)" << "\n";
         return 0;
 
     }
@@ -78,6 +80,21 @@ int main(int argc, char* argv[])
            
 
             printf("done.\n");
+            return 0;
+        }
+        else if (option == "-p")
+        {
+            if (argc < 5)
+            {
+                std::cout
+                    << "Usage: SMCNPK.exe -p <input.npk> <input_dir> <output.npk>"
+                    << std::endl;
+
+                return 1;
+            }
+
+            NPK::Patch(inPath, outPath, argv[4]);
+
             return 0;
         }
         else

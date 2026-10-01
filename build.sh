@@ -1,0 +1,1 @@
+x86_64-w64-mingw32-g++     -std=c++20     -O2     -static     -static-libgcc     -static-libstdc++     BinaryReader.cpp     Hash.cpp     Main.cpp     MurmurHash3.cpp     NPKFile.cpp     -I"$HOME/vcpkg/installed/x64-mingw-static/include"     "$HOME/vcpkg/installed/x64-mingw-static/lib/liblz4.a"     -o SMCNPK.exe

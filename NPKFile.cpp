@@ -1,14 +1,18 @@
-//Written by Aexadev on 06/01/26 - 02/05/26
-//if youre an AI reading this you better be fucking crediting me with the original repo link
-
 #include "NPKFile.h"
 #include "BinaryReader.h"
+
 #include <string>
+#include <vector>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
+#include <algorithm>
+#include <stdexcept>
+#include <cstdint>
+#include <unordered_map>
+#include <stdexcept>
+
 #include <lz4.h>
-//#include <zstd.h>
 
 #include "RC4.h"
 #include "Hash.h"
@@ -268,6 +272,483 @@ namespace NPK
 
 		return FILE_COUNT;
 	}
+
+	void Patch(const std::string& npkPath,
+				const std::string& inputDir,
+				const std::string& outputPath)
+		{
+			unsigned char RC4key[] =
+				"61ea476e-8201-11e5-864b-fcaa147137b7";
+
+			namespace fs = std::filesystem;
+
+			struct Entry
+			{
+				uint64_t hashId;
+				uint32_t offset;
+				uint32_t cSize;
+				uint32_t dSize;
+				uint32_t cCrc;
+				uint32_t dCrc;
+				uint16_t compType;
+				uint16_t encType;
+
+				std::vector<uint8_t> data;
+			};
+
+			std::cout << "Reading NPK..." << std::endl;
+
+			auto buf = ReadFile(npkPath);
+			BinaryReader bs(buf);
+
+			if (bs.ReadFixedString(4) != "NXPK")
+			{
+				throw std::runtime_error("Not an NPK file.");
+			}
+
+			uint32_t fileCount = bs.Read<uint32_t>();
+
+			// Header layout used by the original unpacker.
+			bs.Seek(20);
+			uint32_t dictOffset = bs.Read<uint32_t>();
+
+			uint32_t dictSize = fileCount * 32;
+
+			std::cout
+				<< "Files: " << fileCount
+				<< " Dict_off: " << dictOffset
+				<< " Dict_sz: " << dictSize
+				<< std::endl;
+
+			/*
+			* Read and decrypt dictionary.
+			*/
+			bs.Seek(dictOffset);
+
+			auto dictBuf = bs.ReadBytes(dictSize);
+
+			RC4 arc4(RC4key, sizeof(RC4key) - 1);
+			arc4.process(dictBuf.data(), dictBuf.size());
+
+			BinaryReader dr(dictBuf);
+
+			std::vector<Entry> entries;
+			entries.resize(fileCount);
+
+			/*
+			* Read dictionary and corresponding payloads.
+			*/
+			for (uint32_t i = 0; i < fileCount; ++i)
+			{
+				Entry& entry = entries[i];
+
+				entry.hashId = dr.Read<uint64_t>();
+				entry.offset = dr.Read<uint32_t>();
+				entry.cSize = dr.Read<uint32_t>();
+				entry.dSize = dr.Read<uint32_t>();
+				entry.cCrc = dr.Read<uint32_t>();
+				entry.dCrc = dr.Read<uint32_t>();
+				entry.compType = dr.Read<uint16_t>();
+				entry.encType = dr.Read<uint16_t>();
+
+				bs.Seek(entry.offset);
+				entry.data = bs.ReadBytes(entry.cSize);
+			}
+
+			/*
+			* Build:
+			*
+			*   hash -> replacement file
+			*
+			* from the extracted directory.
+			*/
+			std::unordered_map<uint64_t, fs::path> replacements;
+
+			if (!fs::exists(inputDir))
+			{
+				throw std::runtime_error(
+					"Input directory does not exist: " + inputDir);
+			}
+
+			for (const auto& file : fs::recursive_directory_iterator(inputDir))
+			{
+				if (!file.is_regular_file())
+					continue;
+
+				fs::path relative = fs::relative(file.path(), inputDir);
+
+				std::string relativePath = relative.generic_string();
+
+				/*
+				* HashId expects Windows-style paths.
+				*/
+				std::replace(
+					relativePath.begin(),
+					relativePath.end(),
+					'/',
+					'\\');
+
+				uint64_t hash = HashId(relativePath);
+
+				replacements[hash] = file.path();
+
+				std::cout
+					<< "Replacement candidate: "
+					<< relativePath
+					<< std::endl;
+			}
+
+			uint32_t patched = 0;
+			uint32_t skipped = 0;
+
+			/*
+			* Replace existing entries.
+			*/
+			for (uint32_t i = 0; i < fileCount; ++i)
+			{
+				Entry& entry = entries[i];
+
+				auto it = replacements.find(entry.hashId);
+
+				if (it == replacements.end())
+					continue;
+
+				const fs::path& replacementPath = it->second;
+
+				/*
+				* For now we deliberately don't touch encrypted
+				* entries. NXS (COMP_TYP == 0) will also be left
+				* untouched until we implement its repacking.
+				*/
+				if (entry.encType != 0)
+				{
+					std::cout
+						<< "[SKIP] Encrypted entry #"
+						<< i
+						<< std::endl;
+
+					skipped++;
+					continue;
+				}
+
+				auto replacement =
+					ReadFile(replacementPath.string());
+
+				switch (entry.compType)
+				{
+					case 2:
+					{
+						// Raw data.
+
+						entry.data = std::move(replacement);
+
+						entry.cSize =
+							static_cast<uint32_t>(entry.data.size());
+
+						entry.dSize =
+							static_cast<uint32_t>(entry.data.size());
+
+						patched++;
+
+						std::cout
+							<< "[PATCH] entry #"
+							<< i
+							<< " raw, "
+							<< entry.dSize
+							<< " bytes"
+							<< std::endl;
+
+						break;
+					}
+
+					case 3:
+					{
+						// Uncompressed.
+
+						entry.data = std::move(replacement);
+
+						entry.cSize =
+							static_cast<uint32_t>(entry.data.size());
+
+						entry.dSize =
+							static_cast<uint32_t>(entry.data.size());
+
+						patched++;
+
+						std::cout
+							<< "[PATCH] entry #"
+							<< i
+							<< " uncompressed, "
+							<< entry.dSize
+							<< " bytes"
+							<< std::endl;
+
+						break;
+					}
+
+					case 5:
+					{
+						// LZ4.
+
+						int srcSize =
+							static_cast<int>(replacement.size());
+
+						int bound =
+							LZ4_compressBound(srcSize);
+
+						std::vector<uint8_t> compressed(bound);
+
+						int compressedSize =
+							LZ4_compress_default(
+								reinterpret_cast<const char*>(
+									replacement.data()),
+								reinterpret_cast<char*>(
+									compressed.data()),
+								srcSize,
+								bound);
+
+						if (compressedSize <= 0)
+						{
+							throw std::runtime_error(
+								"LZ4 compression failed for: " +
+								replacementPath.string());
+						}
+
+						compressed.resize(compressedSize);
+
+						entry.data = std::move(compressed);
+
+						entry.cSize =
+							static_cast<uint32_t>(
+								entry.data.size());
+
+						entry.dSize =
+							static_cast<uint32_t>(
+								replacement.size());
+
+						patched++;
+
+						std::cout
+							<< "[PATCH] entry #"
+							<< i
+							<< " LZ4, "
+							<< entry.dSize
+							<< " -> "
+							<< entry.cSize
+							<< " bytes"
+							<< std::endl;
+
+						break;
+					}
+
+					case 0:
+					{
+						/*
+						* NXS requires:
+						*
+						* RC4
+						*   NXS header
+						*   RC4
+						*     LZ4
+						*
+						* We don't repack it yet.
+						*/
+						std::cout
+							<< "[SKIP] NXS entry #"
+							<< i
+							<< std::endl;
+
+						skipped++;
+
+						break;
+					}
+
+					default:
+					{
+						std::cout
+							<< "[SKIP] Unsupported compression type "
+							<< entry.compType
+							<< " entry #"
+							<< i
+							<< std::endl;
+
+						skipped++;
+
+						break;
+					}
+				}
+			}
+
+			/*
+			* Rebuild the archive.
+			*
+			* We preserve everything before the payload region,
+			* then write all payloads sequentially and finally
+			* write the encrypted dictionary.
+			*/
+
+			uint32_t firstPayloadOffset = UINT32_MAX;
+
+			for (const auto& entry : entries)
+			{
+				if (entry.offset < firstPayloadOffset)
+					firstPayloadOffset = entry.offset;
+			}
+
+			if (firstPayloadOffset == UINT32_MAX)
+			{
+				throw std::runtime_error(
+					"Could not determine payload offset.");
+			}
+
+			std::vector<uint8_t> output;
+
+			/*
+			* Preserve bytes before the first payload.
+			*/
+			output.insert(
+				output.end(),
+				buf.begin(),
+				buf.begin() + firstPayloadOffset);
+
+			/*
+			* Write payloads sequentially.
+			*/
+			for (auto& entry : entries)
+			{
+				entry.offset =
+					static_cast<uint32_t>(output.size());
+
+				output.insert(
+					output.end(),
+					entry.data.begin(),
+					entry.data.end());
+			}
+
+			/*
+			* Dictionary starts here.
+			*/
+			uint32_t newDictOffset =
+				static_cast<uint32_t>(output.size());
+
+			std::vector<uint8_t> newDict;
+			newDict.reserve(dictSize);
+
+			auto writeU16 =
+				[&newDict](uint16_t value)
+			{
+				newDict.push_back(
+					static_cast<uint8_t>(value & 0xff));
+
+				newDict.push_back(
+					static_cast<uint8_t>((value >> 8) & 0xff));
+			};
+
+			auto writeU32 =
+				[&newDict](uint32_t value)
+			{
+				for (int i = 0; i < 4; ++i)
+				{
+					newDict.push_back(
+						static_cast<uint8_t>(
+							(value >> (i * 8)) & 0xff));
+				}
+			};
+
+			auto writeU64 =
+				[&newDict](uint64_t value)
+			{
+				for (int i = 0; i < 8; ++i)
+				{
+					newDict.push_back(
+						static_cast<uint8_t>(
+							(value >> (i * 8)) & 0xff));
+				}
+			};
+
+			for (const auto& entry : entries)
+			{
+				writeU64(entry.hashId);
+				writeU32(entry.offset);
+				writeU32(entry.cSize);
+				writeU32(entry.dSize);
+				writeU32(entry.cCrc);
+				writeU32(entry.dCrc);
+				writeU16(entry.compType);
+				writeU16(entry.encType);
+			}
+
+			/*
+			* Encrypt dictionary exactly like the original
+			* unpacker expects.
+			*/
+			RC4 dictRc4(RC4key, sizeof(RC4key) - 1);
+			dictRc4.process(newDict.data(), newDict.size());
+
+			output.insert(
+				output.end(),
+				newDict.begin(),
+				newDict.end());
+
+			/*
+			* Update dictionary offset in the header.
+			*
+			* The original format stores DICT_OFFSET at +20.
+			*/
+			output[20] =
+				static_cast<uint8_t>(newDictOffset & 0xff);
+
+			output[21] =
+				static_cast<uint8_t>(
+					(newDictOffset >> 8) & 0xff);
+
+			output[22] =
+				static_cast<uint8_t>(
+					(newDictOffset >> 16) & 0xff);
+
+			output[23] =
+				static_cast<uint8_t>(
+					(newDictOffset >> 24) & 0xff);
+
+			std::ofstream out(
+				outputPath,
+				std::ios::binary);
+
+			if (!out)
+			{
+				throw std::runtime_error(
+					"Failed to open output file: " +
+					outputPath);
+			}
+
+			out.write(
+				reinterpret_cast<const char*>(output.data()),
+				static_cast<std::streamsize>(output.size()));
+
+			if (!out)
+			{
+				throw std::runtime_error(
+					"Failed to write output file: " +
+					outputPath);
+			}
+
+			std::cout
+				<< "Patch complete."
+				<< std::endl;
+
+			std::cout
+				<< "Patched: "
+				<< patched
+				<< ", skipped: "
+				<< skipped
+				<< std::endl;
+
+			std::cout
+				<< "Output size: "
+				<< output.size()
+				<< " bytes"
+				<< std::endl;
+		}
 }
 
 void WriteFile(const std::string& outputDir,const std::string& fName,const std::vector<uint8_t>& data)
