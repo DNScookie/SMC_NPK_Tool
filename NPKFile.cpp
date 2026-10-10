@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
+#include <limits>
 #include <stdexcept>
 
 #include <lz4.h>
@@ -31,6 +33,163 @@ namespace NPK
 		MurmurHash3_x86_32(path.data(), (int)path.size(), 0x9747B28C, &MMH3);
 
 		return ((uint64_t)hashV1 << 32) | MMH3;//hi V1 lo MMH
+	}
+
+	static uint32_t Crc32(const std::vector<uint8_t>& data)
+	{
+		uint32_t crc = 0xffffffff;
+		for (uint8_t byte : data)
+		{
+			crc ^= byte;
+			for (int bit = 0; bit < 8; ++bit)
+				crc = (crc & 1) ? (crc >> 1) ^ 0xedb88320 : crc >> 1;
+		}
+		return ~crc;
+	}
+
+	void Create(const std::string& inputDir,
+			const std::string& outputPath)
+	{
+		namespace fs = std::filesystem;
+		struct Entry
+		{
+			uint64_t hashId;
+			uint32_t offset = 0;
+			uint32_t size = 0;
+			uint32_t crc = 0;
+			std::string relativePath;
+			fs::path sourcePath;
+		};
+
+		const fs::path inputRoot = fs::weakly_canonical(fs::absolute(inputDir));
+		const fs::path resolvedOutput = fs::weakly_canonical(fs::absolute(outputPath));
+		if (!fs::is_directory(inputRoot))
+			throw std::runtime_error("Input path is not a directory: " + inputDir);
+
+		const fs::path outputRelative = resolvedOutput.lexically_relative(inputRoot);
+		if (!outputRelative.empty() && *outputRelative.begin() != "..")
+			throw std::runtime_error("Output file must be outside the input directory.");
+
+		std::vector<Entry> entries;
+		std::unordered_set<uint64_t> hashes;
+		for (const auto& file : fs::recursive_directory_iterator(inputRoot))
+		{
+			if (!file.is_regular_file())
+				continue;
+
+			std::string relativePath = fs::relative(file.path(), inputRoot).generic_string();
+			std::replace(relativePath.begin(), relativePath.end(), '/', '\\');
+			const uint64_t hashId = HashId(relativePath);
+			if (!hashes.insert(hashId).second)
+				throw std::runtime_error("Duplicate NPK path hash: " + relativePath);
+
+			entries.push_back({ hashId, 0, 0, 0, relativePath, file.path() });
+		}
+
+		if (entries.empty())
+			throw std::runtime_error("Input directory contains no files.");
+		if (entries.size() > std::numeric_limits<uint32_t>::max() / 32)
+			throw std::runtime_error("Too many files for the NPK format.");
+
+		std::sort(entries.begin(), entries.end(),
+			[](const Entry& left, const Entry& right)
+			{
+				return left.relativePath < right.relativePath;
+			});
+
+		const fs::path outputFile = fs::absolute(outputPath);
+		if (!outputFile.parent_path().empty())
+			fs::create_directories(outputFile.parent_path());
+		std::ofstream out(outputFile, std::ios::binary | std::ios::trunc);
+		if (!out)
+			throw std::runtime_error("Failed to open output file: " + outputPath);
+
+		auto writeU32 = [&out](uint32_t value)
+		{
+			uint8_t bytes[4];
+			for (int i = 0; i < 4; ++i)
+				bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xff);
+			out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+		};
+
+		out.write("NXPK", 4);
+		writeU32(static_cast<uint32_t>(entries.size()));
+		writeU32(0);
+		writeU32(0);
+		writeU32(3);
+		writeU32(0);
+
+		for (auto& entry : entries)
+		{
+			const std::streamoff position = out.tellp();
+			if (position < 0 || static_cast<uint64_t>(position) > std::numeric_limits<uint32_t>::max())
+				throw std::runtime_error("NPK payload offset exceeds 32-bit limit.");
+
+			auto data = ReadFile(entry.sourcePath.string());
+			if (data.size() > std::numeric_limits<uint32_t>::max() ||
+				static_cast<uint64_t>(position) + data.size() > std::numeric_limits<uint32_t>::max())
+				throw std::runtime_error("NPK payload exceeds 32-bit limit: " + entry.relativePath);
+
+			entry.offset = static_cast<uint32_t>(position);
+			entry.size = static_cast<uint32_t>(data.size());
+			entry.crc = Crc32(data);
+			if (!data.empty())
+				out.write(reinterpret_cast<const char*>(data.data()),
+					static_cast<std::streamsize>(data.size()));
+			if (!out)
+				throw std::runtime_error("Failed to write payload: " + entry.relativePath);
+		}
+
+		const std::streamoff dictPosition = out.tellp();
+		const uint64_t dictSize = entries.size() * 32ull;
+		if (dictPosition < 0 || static_cast<uint64_t>(dictPosition) + dictSize >
+			std::numeric_limits<uint32_t>::max())
+			throw std::runtime_error("NPK dictionary exceeds 32-bit format limit.");
+		const uint32_t dictOffset = static_cast<uint32_t>(dictPosition);
+
+		std::vector<uint8_t> dictionary;
+		dictionary.reserve(static_cast<size_t>(dictSize));
+		auto appendU16 = [&dictionary](uint16_t value)
+		{
+			dictionary.push_back(static_cast<uint8_t>(value & 0xff));
+			dictionary.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+		};
+		auto appendU32 = [&dictionary](uint32_t value)
+		{
+			for (int i = 0; i < 4; ++i)
+				dictionary.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xff));
+		};
+		auto appendU64 = [&dictionary](uint64_t value)
+		{
+			for (int i = 0; i < 8; ++i)
+				dictionary.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xff));
+		};
+
+		for (const auto& entry : entries)
+		{
+			appendU64(entry.hashId);
+			appendU32(entry.offset);
+			appendU32(entry.size);
+			appendU32(entry.size);
+			appendU32(entry.crc);
+			appendU32(entry.crc);
+			appendU16(3);
+			appendU16(0);
+		}
+
+		unsigned char rc4Key[] = "61ea476e-8201-11e5-864b-fcaa147137b7";
+		RC4 dictRc4(rc4Key, sizeof(rc4Key) - 1);
+		dictRc4.process(dictionary.data(), dictionary.size());
+		out.write(reinterpret_cast<const char*>(dictionary.data()),
+			static_cast<std::streamsize>(dictionary.size()));
+		out.seekp(20);
+		writeU32(dictOffset);
+		out.flush();
+		if (!out)
+			throw std::runtime_error("Failed to finish output NPK: " + outputPath);
+
+		std::cout << "Created " << outputPath << " with " << entries.size()
+			<< " files." << std::endl;
 	}
 
 	void Unpack(std::string& npkPth, std::string& OutPth)
@@ -273,9 +432,10 @@ namespace NPK
 		return FILE_COUNT;
 	}
 
-	void Patch(const std::string& npkPath,
+	uint32_t Patch(const std::string& npkPath,
 				const std::string& inputDir,
-				const std::string& outputPath)
+				const std::string& outputPath,
+				uint64_t targetSize)
 		{
 			unsigned char RC4key[] =
 				"61ea476e-8201-11e5-864b-fcaa147137b7";
@@ -631,6 +791,25 @@ namespace NPK
 			uint32_t newDictOffset =
 				static_cast<uint32_t>(output.size());
 
+			if (targetSize != 0)
+			{
+				const uint64_t targetDictOffset =
+					targetSize >= dictSize ? targetSize - dictSize : 0;
+
+				if (targetSize < dictSize ||
+					targetDictOffset > UINT32_MAX ||
+					targetDictOffset < output.size())
+				{
+					throw std::runtime_error(
+						"Payloads do not fit in the requested NPK size.");
+				}
+
+				output.resize(
+					static_cast<size_t>(targetDictOffset),
+					0);
+				newDictOffset = static_cast<uint32_t>(targetDictOffset);
+			}
+
 			std::vector<uint8_t> newDict;
 			newDict.reserve(dictSize);
 
@@ -690,6 +869,12 @@ namespace NPK
 				newDict.begin(),
 				newDict.end());
 
+			if (targetSize != 0 && output.size() != targetSize)
+			{
+				throw std::runtime_error(
+					"Created NPK size does not match the requested size.");
+			}
+
 			/*
 			* Update dictionary offset in the header.
 			*
@@ -748,6 +933,8 @@ namespace NPK
 				<< output.size()
 				<< " bytes"
 				<< std::endl;
+
+			return patched;
 		}
 }
 

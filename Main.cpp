@@ -4,10 +4,15 @@
 #include <iostream>
 #include <string>
 #include "NPKFile.h"
+#include "PatchInstaller.h"
 #include <filesystem>
 #include <vector>
 int main(int argc, char* argv[])
 {
+    if (argc == 1)
+    {
+        return RunPatchInstaller();
+    }
 
     std::string option;
     std::string inPath;
@@ -29,6 +34,8 @@ int main(int argc, char* argv[])
         std::cout << "options: -u (unpack single .npk)" << "\n";
         std::cout << "         -m (unpack all npk's in the input dir)" << "\n";
         std::cout << "         -p (patch existing files into .npk)" << "\n";
+        std::cout << "            optional: <target-size-bytes>" << "\n";
+        std::cout << "         -c (create .npk from an input directory)" << "\n";
         return 0;
 
     }
@@ -93,8 +100,41 @@ int main(int argc, char* argv[])
                 return 1;
             }
 
-            NPK::Patch(inPath, outPath, argv[4]);
+            uint64_t targetSize = 0;
+            if (argc >= 6)
+            {
+                const std::string sizeArg = argv[5];
+                if (sizeArg.empty() ||
+                    sizeArg.find_first_not_of("0123456789") != std::string::npos)
+                {
+                    std::cerr << "Target size must be a positive integer." << std::endl;
+                    return 1;
+                }
 
+                try
+                {
+                    targetSize = std::stoull(sizeArg);
+                }
+                catch (const std::exception&)
+                {
+                    std::cerr << "Target size is out of range." << std::endl;
+                    return 1;
+                }
+
+                if (targetSize == 0)
+                {
+                    std::cerr << "Target size must be greater than zero." << std::endl;
+                    return 1;
+                }
+            }
+
+            NPK::Patch(inPath, outPath, argv[4], targetSize);
+
+            return 0;
+        }
+        else if (option == "-c")
+        {
+            NPK::Create(inPath, outPath);
             return 0;
         }
         else

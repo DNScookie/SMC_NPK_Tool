@@ -8,9 +8,12 @@ namespace NPK
 	uint64_t HashId(const std::string& path);
 	void BuildDict(std::string& npkPth, std::string& OutPth);
 	uint32_t GetFileCount(std::string& npkPth, std::string& OutPth);
-	void Patch(const std::string& npkPath,
+	uint32_t Patch(const std::string& npkPath,
            const std::string& inputDir,
-           const std::string& outputPath);
+		   const std::string& outputPath,
+		   uint64_t targetSize = 0);
+	void Create(const std::string& inputDir,
+			const std::string& outputPath);
 }
 
 void WriteFile(const std::string& outputDir,
